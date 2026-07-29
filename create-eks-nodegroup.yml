@@ -1,0 +1,106 @@
+name: Create EKS managed node group
+
+on:
+  workflow_dispatch:
+    inputs:
+      nodegroup_name:
+        description: "Managed node group name"
+        required: true
+        default: default-ng
+      ami_id:
+        description: "Custom AL2023 AMI ID in eu-central-1"
+        required: true
+        default: ami-0699e188745b9795a
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: eu-central-1
+  EKS_CLUSTER_NAME: eks-dev-cluster
+  NODEGROUP_NAME: ${{ inputs.nodegroup_name }}
+  NODE_AMI: ${{ inputs.ami_id }}
+  SUBNET_IDS: subnet-0e37ceeadcb8be5b5,subnet-0f130accc5b04bd27
+
+jobs:
+  create-nodegroup:
+    name: Create managed node group
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure AWS credentials with OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: github-actions-eks-nodegroup
+
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity
+
+      - name: Install eksctl
+        shell: bash
+        run: |
+          set -euo pipefail
+          EKSCTL_VERSION="$(curl -fsSL https://api.github.com/repos/eksctl-io/eksctl/releases/latest | jq -r .tag_name)"
+          curl -fsSL \
+            "https://github.com/eksctl-io/eksctl/releases/download/${EKSCTL_VERSION}/eksctl_Linux_amd64.tar.gz" \
+            -o eksctl.tar.gz
+          tar -xzf eksctl.tar.gz
+          sudo install -m 0755 eksctl /usr/local/bin/eksctl
+          eksctl version
+
+      - name: Validate cluster and AMI
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws eks describe-cluster \
+            --name "$EKS_CLUSTER_NAME" \
+            --region "$AWS_REGION" \
+            --query 'cluster.status' \
+            --output text | grep -x ACTIVE
+
+          aws ec2 describe-images \
+            --image-ids "$NODE_AMI" \
+            --region "$AWS_REGION" \
+            --query 'Images[0].ImageId' \
+            --output text | grep -x "$NODE_AMI"
+
+      - name: Create node group if absent
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if eksctl get nodegroup \
+              --cluster "$EKS_CLUSTER_NAME" \
+              --region "$AWS_REGION" \
+              --name "$NODEGROUP_NAME" \
+              --output json | jq -e 'length > 0' >/dev/null; then
+            echo "Node group ${NODEGROUP_NAME} already exists; no creation performed."
+            exit 0
+          fi
+
+          eksctl create nodegroup \
+            --cluster "$EKS_CLUSTER_NAME" \
+            --name "$NODEGROUP_NAME" \
+            --node-ami "$NODE_AMI" \
+            --node-ami-family AmazonLinux2023 \
+            --region "$AWS_REGION" \
+            --node-type t3.medium \
+            --subnet-ids "$SUBNET_IDS" \
+            --nodes 2 \
+            --nodes-min 1 \
+            --nodes-max 3 \
+            --managed
+
+      - name: Show resulting node group
+        shell: bash
+        run: |
+          aws eks describe-nodegroup \
+            --cluster-name "$EKS_CLUSTER_NAME" \
+            --nodegroup-name "$NODEGROUP_NAME" \
+            --region "$AWS_REGION" \
+            --query 'nodegroup.{Status:status,Version:version,AMIType:amiType,CapacityType:capacityType,Desired:scalingConfig.desiredSize,Min:scalingConfig.minSize,Max:scalingConfig.maxSize}' \
+            --output table
